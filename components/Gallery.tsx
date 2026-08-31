@@ -30,7 +30,9 @@ const IMAGES = [
   { src: "/gallery/08.jpg", width: 324, lift: 64 },
 ];
 
-/** Speed at the viewport centre, px/s. Edge speed = MIN_SCALE × DRIFT. */
+/** Speed at the viewport centre on a 1440px-wide screen, px/s; it scales
+ * with the viewport so a card takes the same time to cross any screen.
+ * Edge speed = MIN_SCALE × speed. */
 const DRIFT = 500;
 /** Gap at the centre, px — it shrinks with the cards toward the edges. */
 const CARD_GAP = 10;
@@ -39,17 +41,39 @@ const CARD_GAP = 10;
  * of keeping gaps uniform, not a bug. */
 const MIN_SCALE = 0.1;
 
+/** Height of the row at full size: the tallest card (3:4 box) plus its lift.
+ * `--s` is chosen so this always fits inside the section. */
+const ROW_HEIGHT = Math.max(...IMAGES.map((i) => i.lift + (i.width * 4) / 3));
+
 export function Gallery() {
   const section = useRef<HTMLElement>(null);
   const viewport = useRef<HTMLDivElement>(null);
   const track = useRef<HTMLDivElement>(null);
 
-  useGSAP(
-    () => {
-      const trackEl = track.current!;
-      const viewportEl = viewport.current!;
-      const items = gsap.utils.toArray<HTMLElement>(".gallery-item", trackEl);
+  useGSAP(() => {
+    const sectionEl = section.current!;
+    const viewportEl = viewport.current!;
+    const trackEl = track.current!;
+    const items = gsap.utils.toArray<HTMLElement>(".gallery-item", trackEl);
+
+    // Everything below is measured, so it is rebuilt whenever the section's
+    // size changes (rotation, resize). `progress` carries the row position
+    // across a rebuild so the loop doesn't jump.
+    let progress = 0;
+    let teardown = () => {};
+
+    const build = () => {
+      teardown();
+
+      // --s scales every card width, lift and gap together: full size on a
+      // 1440px-wide screen, never wider than that ratio, and never taller
+      // than the section (minus breathing room) — so no page scrollbar.
+      const fitW = sectionEl.offsetWidth / 1440;
+      const fitH = (sectionEl.offsetHeight - 96) / ROW_HEIGHT;
+      gsap.set(trackEl, { "--s": gsap.utils.clamp(0.45, 1, Math.min(fitW, fitH)) });
+
       const setWidth = items[IMAGES.length].offsetLeft - items[0].offsetLeft;
+      const speed = (DRIFT * viewportEl.offsetWidth) / 1440;
 
       /*
         A constant-speed row seen through a fixed lens. F warps the x axis:
@@ -69,45 +93,42 @@ export function Gallery() {
       const lefts = items.map((el) => el.offsetLeft);
       const widths = items.map((el) => el.offsetWidth);
 
-      // Promote every animated element to its own compositor layer, and seed
-      // the transforms so GSAP's per-frame setters below have a cache to
-      // write into.
-      gsap.set([trackEl, ...items], { x: 0, scale: 1, willChange: "transform" });
       // One "css" setter per card: x and scale land in a single transform
       // write (separate per-property scale setters don't render).
+      gsap.set(items, { willChange: "transform" });
       const setCard = items.map((el) => gsap.quickSetter(el, "css"));
 
+      // The track itself never moves: the row offset `x` is folded into each
+      // card's own transform. The middle of three copies is on screen; wrap
+      // keeps it there.
       const paint = (x: number) => {
         for (let i = 0; i < items.length; i++) {
           const l = F(lefts[i] + x);
           const r = F(lefts[i] + x + widths[i]);
           setCard[i]({
-            x: (l + r) / 2 - (lefts[i] + x + widths[i] / 2),
+            x: (l + r) / 2 - (lefts[i] + widths[i] / 2),
             scale: (r - l) / widths[i],
           });
         }
       };
 
-      // The middle of three copies is on screen; wrap keeps it there.
-      const setX = gsap.quickSetter(trackEl, "x", "px");
       const wrap = gsap.utils.wrap(-2 * setWidth, -setWidth);
       const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
-      let offset = -setWidth;
+      let offset = -2 * setWidth + progress * setWidth;
       let dragging = false;
 
       const tick = (_: number, dt: number) => {
-        if (!dragging && !reduced.matches) offset -= (DRIFT * dt) / 1000;
+        if (!dragging && !reduced.matches) offset -= (speed * dt) / 1000;
         const x = wrap(offset);
-        setX(x);
+        progress = (x + 2 * setWidth) / setWidth;
         paint(x);
       };
       gsap.ticker.add(tick);
 
       // Draggable drives a detached proxy; we only read its x.
       const proxy = document.createElement("div");
-      let start = 0;
       const sync = () => {
-        offset = start + Number(gsap.getProperty(proxy, "x"));
+        offset = Number(gsap.getProperty(proxy, "x"));
       };
       const [drag] = Draggable.create(proxy, {
         type: "x",
@@ -117,8 +138,7 @@ export function Gallery() {
         activeCursor: "grabbing",
         allowNativeTouchScrolling: true,
         onPressInit() {
-          gsap.set(proxy, { x: 0 });
-          start = offset;
+          gsap.set(proxy, { x: offset });
           dragging = true;
         },
         onDrag: sync,
@@ -131,30 +151,49 @@ export function Gallery() {
         },
       });
 
-      return () => {
+      // Paint the new layout now rather than on the next frame, so a
+      // resize never shows one frame of stale transforms.
+      paint(wrap(offset));
+
+      teardown = () => {
         gsap.ticker.remove(tick);
         drag.kill();
       };
-    },
-    { scope: section },
-  );
+    };
+
+    build();
+    // The section is 100svh, which ignores the mobile address bar, so this
+    // only fires for real size changes.
+    const observer = new ResizeObserver(build);
+    observer.observe(sectionEl);
+
+    return () => {
+      observer.disconnect();
+      teardown();
+    };
+  });
 
   return (
-    <section ref={section} aria-label="Gallery" className="overflow-hidden py-24">
-      <div
-        ref={viewport}
-        className="select-none overflow-hidden"
-      >
+    // Exactly one viewport tall, row centred in it — nothing to scroll.
+    <section
+      ref={section}
+      aria-label="Gallery"
+      className="flex h-svh items-center overflow-hidden"
+    >
+      <div ref={viewport} className="w-full select-none overflow-hidden">
         <div
           ref={track}
           className="flex w-max items-start"
-          style={{ columnGap: CARD_GAP }}
+          style={{ columnGap: `calc(${CARD_GAP}px * var(--s))` }}
         >
           {[...IMAGES, ...IMAGES, ...IMAGES].map((image, i) => (
             <div
               key={i}
               className="gallery-item shrink-0"
-              style={{ width: image.width, marginTop: image.lift }}
+              style={{
+                width: `calc(${image.width}px * var(--s))`,
+                marginTop: `calc(${image.lift}px * var(--s))`,
+              }}
               aria-hidden={i >= IMAGES.length || undefined}
             >
               <div className="relative aspect-3/4 overflow-hidden rounded-2xl bg-[#141414]">
@@ -162,7 +201,7 @@ export function Gallery() {
                   src={image.src}
                   alt=""
                   fill
-                  sizes="(min-width: 1024px) 344px, 60vw"
+                  sizes="(min-width: 1024px) 344px, (min-width: 640px) 240px, 172px"
                   className="object-cover"
                   draggable={false}
                 />
